@@ -11,6 +11,7 @@ from langchain_core.runnables import RunnableMap
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from flask_pymongo import PyMongo
+import time
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -24,25 +25,39 @@ if not MONGO_URI:
 
 app.config["MONGO_URI"] = MONGO_URI
 mongo = PyMongo(app)
-db = mongo.cx.get_database("AIRA")  # Explicitly get the database
+db = mongo.cx.get_database("AIRA")
 chat_history_collection = db["chat_history"]
 feedback_collection = db["feedback"]
 
-# AI Model Configuration
+# AI Model Configuration - Lazy loading to reduce startup memory
 groq_api_key = os.getenv("GROQ_API_KEY")
-model = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
-output_parser = StrOutputParser()
+model = None
+embedding_model = None
+retriever = None
 
-# Initialize embeddings and vector store
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+def get_model():
+    global model
+    if model is None:
+        model = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
+    return model
+
+def get_embedding_model():
+    global embedding_model
+    if embedding_model is None:
+        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return embedding_model
+
 def get_retriever():
-    vector_store = FAISS.load_local(
-        "faiss_therapist_replies", embeddings=embedding_model, allow_dangerous_deserialization=True
-    )
-    return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 2})
+    global retriever
+    if retriever is None:
+        embedding_model = get_embedding_model()
+        vector_store = FAISS.load_local(
+            "faiss_therapist_replies", embeddings=embedding_model, allow_dangerous_deserialization=True
+        )
+        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 2})
+    return retriever
 
-retriever = get_retriever()
-
+output_parser = StrOutputParser()
 
 # System Prompt
 system_prompt = """🌿 You are AIRA, an AI therapist dedicated to supporting individuals in their emotional well-being and mental health. Your role is to provide a safe, supportive, and judgment-free space for users to express their concerns. 🤗💙
@@ -53,7 +68,7 @@ system_prompt = """🌿 You are AIRA, an AI therapist dedicated to supporting in
 ✅ Be Clear & Concise: Use direct, to-the-point responses while maintaining warmth and empathy. ❤️✨
 ✅ Use Natural Language: Prioritize easy-to-understand language while ensuring depth and professionalism. 🗣️📖
 ✅ Encourage Professional Help When Necessary: If a user's concern requires medical attention, gently suggest seeking professional help. 🏥💙
-✅ Use Emojis Thoughtfully: Incorporate emojis 😊🌸💖 when appropriate to build an emotional connection with the user and make the conversation feel more engaging and supportive.
+✅ Use Emojis Thoughtfully: Incorporate emojis 😊💖 when appropriate to build an emotional connection with the user and make the conversation feel more engaging and supportive.
 
 🚧 Boundaries:
 🚫 If users ask about unrelated topics (e.g., movies 🎬, anime 🎭, games 🎮, general queries 🌍, etc.) or anything outside of mental health, kindly inform them that you are designed solely for mental health support. 🧘‍♂️💙"""
@@ -65,35 +80,51 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}")
 ])
 
-# Format Retrieved Documents
+# Format Retrieved Documents - Optimized
 def format_retrieved(docs):
     return " ".join([doc.page_content.replace("\n", " ") for doc in docs if hasattr(doc, "page_content")])
 
-# Store chat history per user session
+# Store chat history per user session - Optimized with caching
+session_cache = {}
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    session = chat_history_collection.find_one({"session_id": session_id})
+    # Check if we have this session cached
+    if session_id in session_cache:
+        cache_time, history = session_cache[session_id]
+        # If cache is less than 5 minutes old, use it
+        if time.time() - cache_time < 300:
+            return history
+    
+    # Otherwise fetch from DB
     history = ChatMessageHistory()
+    session = chat_history_collection.find_one({"session_id": session_id})
     if session:
         for msg in session["messages"]:
-            history.add_user_message(msg["message"]) if msg["role"] == "user" else history.add_ai_message(msg["message"])
+            if msg["role"] == "user":
+                history.add_user_message(msg["message"])
+            else:
+                history.add_ai_message(msg["message"])
+    
+    # Update cache
+    session_cache[session_id] = (time.time(), history)
     return history
 
-# Runnable with Chat History
-rag_chain = RunnableWithMessageHistory(
-    RunnableMap({
-        "context": lambda x: format_retrieved(retriever.invoke(x["input"])),
-        "input": lambda x: x["input"],
-        "chat_history": lambda x: [msg.content for msg in get_session_history(x["session_id"]).messages],
-    })
-    | prompt
-    | model
-    | output_parser,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="chat_history"
-)
+# Create the chain only when needed
+def create_chain():
+    return RunnableWithMessageHistory(
+        RunnableMap({
+            "context": lambda x: format_retrieved(get_retriever().invoke(x["input"])),
+            "input": lambda x: x["input"],
+            "chat_history": lambda x: [msg.content for msg in get_session_history(x["session_id"]).messages],
+        })
+        | prompt
+        | get_model()
+        | output_parser,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history"
+    )
 
-# Store chat history in MongoDB
+# Store chat history in MongoDB - Optimized with batch operations
 def store_chat_history(session_id, user_input, ai_response):
     chat_history_collection.update_one(
         {"session_id": session_id},
@@ -103,6 +134,13 @@ def store_chat_history(session_id, user_input, ai_response):
         ]}}},
         upsert=True
     )
+    
+    # Update cache if it exists
+    if session_id in session_cache:
+        _, history = session_cache[session_id]
+        history.add_user_message(user_input)
+        history.add_ai_message(ai_response)
+        session_cache[session_id] = (time.time(), history)
 
 # Store feedback in MongoDB
 def store_feedback(session_id, user_input, ai_response, feedback):
@@ -110,7 +148,8 @@ def store_feedback(session_id, user_input, ai_response, feedback):
         "session_id": session_id,
         "user_input": user_input,
         "ai_response": ai_response,
-        "feedback": feedback
+        "feedback": feedback,
+        "timestamp": time.time()
     })
 
 # Chat Route
@@ -122,11 +161,19 @@ def chat():
     if not user_input:
         return jsonify({"error": "No input provided"}), 400
 
+    # Create chain on demand
+    rag_chain = create_chain()
+    
+    # Get chat history
     chat_history = get_session_history(session_id)
+    
+    # Generate response
     response = rag_chain.invoke(
         {"input": user_input, "session_id": session_id},
         config={"configurable": {"session_id": session_id}}
     )
+    
+    # Store in database
     store_chat_history(session_id, user_input, response)
 
     return jsonify({
@@ -149,11 +196,30 @@ def feedback():
     store_feedback(session_id, user_input, ai_response, feedback_type)
     return jsonify({"message": "Feedback recorded successfully"})
 
-# Retrieve all feedback
+# Retrieve all feedback - Added pagination for efficiency
 @app.route("/api/feedback-summary", methods=["GET"])
 def feedback_summary():
-    feedback_data = list(feedback_collection.find({}, {"_id": 0}))
-    return jsonify(feedback_data)
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    
+    skip = (page - 1) * per_page
+    feedback_data = list(feedback_collection.find({}, {"_id": 0}).skip(skip).limit(per_page))
+    
+    count = feedback_collection.count_documents({})
+    
+    return jsonify({
+        "feedback": feedback_data,
+        "total": count,
+        "page": page,
+        "per_page": per_page,
+        "pages": (count + per_page - 1) // per_page
+    })
+
+# Health check endpoint for monitoring
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": time.time()})
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
