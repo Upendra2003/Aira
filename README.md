@@ -12,7 +12,7 @@ AIRA is an AI therapist application designed to provide mental health support th
 ## Requirements
 
 - Python 3.9+
-- MongoDB database (can use MongoDB Atlas free tier)
+- MongoDB database 
 - Groq API key
 
 ## Setup Instructions
@@ -31,12 +31,6 @@ AIRA is an AI therapist application designed to provide mental health support th
    ```
    python app.py
    ```
-
-## Deployment to Render
-
-1. Connect your GitHub repository to Render
-2. Set the required environment variables in the Render dashboard
-3. Deploy using the settings in `render.yaml`
 
 ## API Endpoints
 
