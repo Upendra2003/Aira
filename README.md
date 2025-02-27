@@ -64,14 +64,5 @@ AIRA is an AI therapist application designed to provide mental health support th
 
 - `GET /memory` - Memory usage monitoring
 
-## Memory Optimization
-
-This application is optimized for Render's free tier with the following strategies:
-
-1. Lazy loading of models and components
-2. Session caching with expiration
-3. Garbage collection after requests
-4. Single worker with thread-based concurrency
-5. Memory monitoring endpoints
 
 
