@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: aira
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --config gunicorn_config.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "true"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MONGO_CONNECTION_STRING
+        sync: false
+    autoDeploy: true
